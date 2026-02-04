@@ -1,9 +1,19 @@
 locals {
   enabled = module.this.enabled
 
-  eks_cluster_oidc_issuer = local.enabled ? replace(var.eks_cluster_oidc_issuer_url, "https://", "") : ""
+  eks_cluster_oidc_issuer = local.enabled && var.eks_cluster_oidc_issuer_url != null ? replace(var.eks_cluster_oidc_issuer_url, "https://", "") : ""
 
   aws_account_number = local.enabled ? coalesce(var.aws_account_number, data.aws_caller_identity.current[0].account_id) : ""
+
+  # Cross-account specific locals
+  cross_account_enabled     = local.enabled && length(var.cross_account_role_arns) > 0
+  cross_account_external_id = var.cross_account_external_id == "auto" ? random_id.cross_account_external_id[0].hex : var.cross_account_external_id
+
+  # Extract account IDs from cross-account role ARNs for validation
+  cross_account_account_ids = [
+    for arn in var.cross_account_role_arns :
+    split(":", arn)[4] if can(regex("^arn:aws:iam::[0-9]{12}:role/.+", arn))
+  ]
 
   # If both var.service_account_namespace and var.service_account_name are provided,
   # then the role ARN will have one of the following formats:
@@ -44,6 +54,12 @@ data "aws_caller_identity" "current" {
   count = local.enabled ? 1 : 0
 }
 
+# Generate random external ID when "auto" is specified
+resource "random_id" "cross_account_external_id" {
+  count       = local.enabled && var.cross_account_external_id == "auto" ? 1 : 0
+  byte_length = 16 # 32-character hex string for strong security
+}
+
 module "service_account_label" {
   source  = "cloudposse/label/null"
   version = "0.25.0"
@@ -62,14 +78,14 @@ module "service_account_label" {
 resource "aws_iam_role" "service_account" {
   count                = local.enabled ? 1 : 0
   name                 = module.service_account_label.id
-  description          = format("Role assumed by EKS ServiceAccount %s", local.service_account_id)
-  assume_role_policy   = data.aws_iam_policy_document.service_account_assume_role[0].json
+  description          = format("Role assumed by EKS ServiceAccount %s using %s", local.service_account_id, var.authentication_mode == "irsa" ? "IRSA" : "Pod Identity")
+  assume_role_policy   = var.authentication_mode == "irsa" ? data.aws_iam_policy_document.service_account_assume_role[0].json : data.aws_iam_policy_document.service_account_assume_role_pod_identity[0].json
   tags                 = module.service_account_label.tags
   permissions_boundary = var.permissions_boundary
 }
 
 data "aws_iam_policy_document" "service_account_assume_role" {
-  count = local.enabled ? 1 : 0
+  count = local.enabled && var.authentication_mode == "irsa" ? 1 : 0
 
   statement {
     actions = [
@@ -98,8 +114,22 @@ data "aws_iam_policy_document" "service_account_assume_role" {
 
   lifecycle {
     precondition {
-      condition     = length(local.eks_cluster_oidc_issuer) > 0
-      error_message = "The eks_cluster_oidc_issuer_url value must have a value."
+      condition     = var.authentication_mode == "pod_identity" || (var.authentication_mode == "irsa" && var.eks_cluster_oidc_issuer_url != null && length(local.eks_cluster_oidc_issuer) > 0)
+      error_message = "The eks_cluster_oidc_issuer_url value must be provided when using IRSA authentication mode."
+    }
+  }
+}
+
+data "aws_iam_policy_document" "service_account_assume_role_pod_identity" {
+  count = local.enabled && var.authentication_mode == "pod_identity" ? 1 : 0
+
+  statement {
+    actions = ["sts:AssumeRole"]
+    effect  = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]
     }
   }
 }
@@ -122,4 +152,65 @@ resource "aws_iam_role_policy_attachment" "managed" {
   for_each   = local.enabled ? var.managed_policy_arns : []
   role       = aws_iam_role.service_account[0].name
   policy_arn = each.key
+}
+
+# EKS Pod Identity Association - links the IAM role to the Kubernetes service account
+resource "aws_eks_pod_identity_association" "this" {
+  count = local.enabled && var.authentication_mode == "pod_identity" ? 1 : 0
+
+  cluster_name    = var.eks_cluster_name
+  namespace       = var.service_account_namespace
+  service_account = var.service_account_name
+  role_arn        = aws_iam_role.service_account[0].arn
+
+  tags = module.service_account_label.tags
+
+  lifecycle {
+    precondition {
+      condition     = var.eks_cluster_name != null
+      error_message = "eks_cluster_name must be provided when using Pod Identity authentication mode."
+    }
+
+    precondition {
+      condition     = var.service_account_name != null
+      error_message = "service_account_name must be provided when using Pod Identity authentication mode."
+    }
+
+    precondition {
+      condition     = var.service_account_namespace != null
+      error_message = "service_account_namespace must be provided when using Pod Identity authentication mode."
+    }
+  }
+}
+
+# IAM policy document for cross-account role assumption
+data "aws_iam_policy_document" "cross_account_assume_role" {
+  count = local.cross_account_enabled ? 1 : 0
+
+  statement {
+    sid     = "AssumeRolesInOtherAccounts"
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    resources = var.cross_account_role_arns
+
+    # Conditionally add external ID requirement if specified
+    dynamic "condition" {
+      for_each = local.cross_account_external_id != null ? [1] : []
+      content {
+        test     = "StringEquals"
+        variable = "sts:ExternalId"
+        values   = [local.cross_account_external_id]
+      }
+    }
+  }
+}
+
+# Attach cross-account assume role policy as inline policy
+resource "aws_iam_role_policy" "cross_account_assume_role" {
+  count = local.cross_account_enabled ? 1 : 0
+
+  name   = "${module.service_account_label.id}-cross-account-assume"
+  role   = aws_iam_role.service_account[0].id
+  policy = data.aws_iam_policy_document.cross_account_assume_role[0].json
 }

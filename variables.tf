@@ -49,7 +49,8 @@ variable "aws_iam_policy_document" {
 
 variable "eks_cluster_oidc_issuer_url" {
   type        = string
-  description = "OIDC issuer URL for the EKS cluster (initial \"https://\" may be omitted)"
+  description = "OIDC issuer URL for the EKS cluster (initial \"https://\" may be omitted). Required for 'irsa' authentication mode, optional for 'pod_identity' mode."
+  default     = null
 }
 
 variable "permissions_boundary" {
@@ -62,4 +63,66 @@ variable "managed_policy_arns" {
   type        = set(string)
   description = "List of managed policies to attach to created role"
   default     = []
+}
+
+variable "authentication_mode" {
+  type        = string
+  description = <<-EOT
+    Authentication mode for the IAM role. Valid values are:
+    - 'irsa': Use IAM Roles for Service Accounts (OIDC-based, default for backward compatibility)
+    - 'pod_identity': Use EKS Pod Identity (simpler, recommended for new deployments)
+    EOT
+  default     = "irsa"
+
+  validation {
+    condition     = contains(["irsa", "pod_identity"], var.authentication_mode)
+    error_message = "The authentication_mode must be either 'irsa' or 'pod_identity'."
+  }
+}
+
+variable "eks_cluster_name" {
+  type        = string
+  description = "EKS cluster name. Required when using 'pod_identity' authentication mode to create the Pod Identity association."
+  default     = null
+}
+
+variable "cross_account_role_arns" {
+  type        = list(string)
+  description = <<-EOT
+    List of cross-account IAM role ARNs that this role should be able to assume. 
+    Each ARN must be from a different AWS account than the current one.
+    Used for cross-account access patterns where EKS pods need to access resources in other accounts.
+    
+    Example: ["arn:aws:iam::111111111111:role/CrossAccountDataAccess", "arn:aws:iam::222222222222:role/CrossAccountS3Access"]
+    EOT
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.cross_account_role_arns :
+      can(regex("^arn:aws:iam::[0-9]{12}:role/.+", arn))
+    ])
+    error_message = "All cross_account_role_arns must be valid IAM role ARNs with format 'arn:aws:iam::ACCOUNT-ID:role/ROLE-NAME'."
+  }
+}
+
+variable "cross_account_external_id" {
+  type        = string
+  description = <<-EOT
+    External ID for cross-account role assumption security. Controls the sts:ExternalId condition in the assume role policy.
+    
+    Options:
+    - null: No external ID required (default, appropriate for trusted environments)
+    - "auto": Auto-generate a random external ID for enhanced security
+    - "<custom-id>": Use your specific external ID (recommended for production)
+    - "" (empty string): Will cause validation error - use one of the above options
+    
+    Note: If using external ID, the target cross-account roles must also require the same external ID.
+    EOT
+  default     = null
+
+  validation {
+    condition     = var.cross_account_external_id != ""
+    error_message = "cross_account_external_id cannot be empty string. Use null (no external ID), \"auto\" (auto-generate), or provide a specific external ID."
+  }
 }

@@ -33,6 +33,11 @@
 This `terraform-aws-eks-iam-role` project provides a simplified mechanism for provisioning
 [AWS EKS Service Account IAM roles](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html).
 
+## Features
+
+- **Multiple Authentication Modes**: Supports both IRSA (IAM Roles for Service Accounts) and EKS Pod Identity
+- **Backward Compatible**: Defaults to IRSA mode for existing deployments
+
 
 > [!TIP]
 > #### 👽 Use Atmos with Terraform
@@ -51,13 +56,13 @@ This `terraform-aws-eks-iam-role` project provides a simplified mechanism for pr
 
 ## Usage
 
-Here's how to invoke this module in your projects
+## IRSA (IAM Roles for Service Accounts) - Default Mode
 
 ```hcl
 module "eks_iam_role" {
   source = "cloudposse/eks-iam-role/aws"
   # Cloud Posse recommends pinning every module to a specific version
-  # version     = "x.x.x"
+  # version = "x.x.x"
 
   namespace   = var.namespace
   environment = var.environment
@@ -67,6 +72,8 @@ module "eks_iam_role" {
   attributes  = var.attributes
   tags        = var.tags
 
+  # IRSA mode (default) - requires OIDC issuer URL
+  authentication_mode         = "irsa"  # optional, defaults to "irsa"
   aws_account_number          = local.account_id
   eks_cluster_oidc_issuer_url = module.eks_cluster.eks_cluster_identity_oidc_issuer
 
@@ -76,26 +83,36 @@ module "eks_iam_role" {
   # JSON IAM policy document to assign to the service account role
   aws_iam_policy_document = [data.aws_iam_policy_document.autoscaler.json]
 }
+```
 
-data "aws_iam_policy_document" "autoscaler" {
-  statement {
-    sid = "AllowToScaleEKSNodeGroupAutoScalingGroup"
+## EKS Pod Identity
 
-    actions = [
-      "ec2:DescribeLaunchTemplateVersions",
-      "autoscaling:TerminateInstanceInAutoScalingGroup",
-      "autoscaling:SetDesiredCapacity",
-      "autoscaling:DescribeTags",
-      "autoscaling:DescribeLaunchConfigurations",
-      "autoscaling:DescribeAutoScalingInstances",
-      "autoscaling:DescribeAutoScalingGroups"
-    ]
+```hcl
+module "eks_iam_role_pod_identity" {
+  source = "cloudposse/eks-iam-role/aws"
+  # Cloud Posse recommends pinning every module to a specific version
+  # version = "x.x.x"
 
-    effect    = "Allow"
-    resources = ["*"]
-  }
+  namespace   = var.namespace
+  environment = var.environment
+  stage       = var.stage
+  name        = var.name
+
+  # Pod Identity mode - simpler, no OIDC configuration required
+  authentication_mode = "pod_identity"
+  eks_cluster_name    = "my-eks-cluster"  # Required for Pod Identity associations
+  aws_account_number  = local.account_id
+  # eks_cluster_oidc_issuer_url not required for Pod Identity
+
+  # Create a role for the service account
+  service_account_name      = "aws-load-balancer-controller"
+  service_account_namespace = "kube-system"
+  # JSON IAM policy document to assign to the service account role
+  aws_iam_policy_document = [data.aws_iam_policy_document.load_balancer_controller.json]
 }
 ```
+
+**Note**: When using Pod Identity mode, the module automatically creates the EKS Pod Identity association that links the IAM role to the Kubernetes service account. No manual `aws eks create-pod-identity-association` commands are needed!
 
 > [!IMPORTANT]
 > In Cloud Posse's examples, we avoid pinning modules to specific versions to prevent discrepancies between the documentation
@@ -109,8 +126,9 @@ data "aws_iam_policy_document" "autoscaler" {
 
 ## Examples
 
-Here is an example of using this module:
-- [`examples/complete`](https://github.com/cloudposse/terraform-aws-eks-iam-role/tree/master/examples/complete) - complete example of using this module
+Here are examples of using this module:
+- [`examples/complete`](https://github.com/cloudposse/terraform-aws-eks-iam-role/tree/master/examples/complete) - complete example using IRSA authentication mode
+- [`examples/pod-identity`](https://github.com/cloudposse/terraform-aws-eks-iam-role/tree/master/examples/pod-identity) - example using EKS Pod Identity authentication mode
 
 
 
@@ -128,7 +146,7 @@ Here is an example of using this module:
 
 | Name | Version |
 |------|---------|
-| <a name="provider_aws"></a> [aws](#provider\_aws) | >= 3.0 |
+| <a name="provider_aws"></a> [aws](#provider\_aws) | 6.30.0 |
 
 ## Modules
 
@@ -141,12 +159,14 @@ Here is an example of using this module:
 
 | Name | Type |
 |------|------|
+| [aws_eks_pod_identity_association.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eks_pod_identity_association) | resource |
 | [aws_iam_policy.service_account](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_policy) | resource |
 | [aws_iam_role.service_account](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role) | resource |
 | [aws_iam_role_policy_attachment.managed](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy_attachment) | resource |
 | [aws_iam_role_policy_attachment.service_account](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy_attachment) | resource |
 | [aws_caller_identity.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/caller_identity) | data source |
 | [aws_iam_policy_document.service_account_assume_role](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
+| [aws_iam_policy_document.service_account_assume_role_pod_identity](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
 
 ## Inputs
 
@@ -154,13 +174,15 @@ Here is an example of using this module:
 |------|-------------|------|---------|:--------:|
 | <a name="input_additional_tag_map"></a> [additional\_tag\_map](#input\_additional\_tag\_map) | Additional key-value pairs to add to each map in `tags_as_list_of_maps`. Not added to `tags` or `id`.<br/>This is for some rare cases where resources want additional configuration of tags<br/>and therefore take a list of maps with tag key, value, and additional configuration. | `map(string)` | `{}` | no |
 | <a name="input_attributes"></a> [attributes](#input\_attributes) | ID element. Additional attributes (e.g. `workers` or `cluster`) to add to `id`,<br/>in the order they appear in the list. New attributes are appended to the<br/>end of the list. The elements of the list are joined by the `delimiter`<br/>and treated as a single ID element. | `list(string)` | `[]` | no |
+| <a name="input_authentication_mode"></a> [authentication\_mode](#input\_authentication\_mode) | Authentication mode for the IAM role. Valid values are:<br/>- 'irsa': Use IAM Roles for Service Accounts (OIDC-based, default for backward compatibility)<br/>- 'pod\_identity': Use EKS Pod Identity (simpler, recommended for new deployments) | `string` | `"irsa"` | no |
 | <a name="input_aws_account_number"></a> [aws\_account\_number](#input\_aws\_account\_number) | AWS account number of EKS cluster owner. If an AWS account number is not provided, the current aws provider account number will be used. | `string` | `null` | no |
 | <a name="input_aws_iam_policy_document"></a> [aws\_iam\_policy\_document](#input\_aws\_iam\_policy\_document) | JSON string representation of the IAM policy for this service account as list of string (0 or 1 items).<br/>If empty, no custom IAM policy document will be used. If the list contains a single document, a custom<br/>IAM policy will be created and attached to the IAM role.<br/>Can also be a plain string, but that use is DEPRECATED because of Terraform issues. | `any` | `[]` | no |
 | <a name="input_aws_partition"></a> [aws\_partition](#input\_aws\_partition) | AWS partition: 'aws', 'aws-cn', or 'aws-us-gov' | `string` | `"aws"` | no |
 | <a name="input_context"></a> [context](#input\_context) | Single object for setting entire context at once.<br/>See description of individual variables for details.<br/>Leave string and numeric variables as `null` to use default value.<br/>Individual variable settings (non-null) override settings in context object,<br/>except for attributes, tags, and additional\_tag\_map, which are merged. | `any` | <pre>{<br/>  "additional_tag_map": {},<br/>  "attributes": [],<br/>  "delimiter": null,<br/>  "descriptor_formats": {},<br/>  "enabled": true,<br/>  "environment": null,<br/>  "id_length_limit": null,<br/>  "label_key_case": null,<br/>  "label_order": [],<br/>  "label_value_case": null,<br/>  "labels_as_tags": [<br/>    "unset"<br/>  ],<br/>  "name": null,<br/>  "namespace": null,<br/>  "regex_replace_chars": null,<br/>  "stage": null,<br/>  "tags": {},<br/>  "tenant": null<br/>}</pre> | no |
 | <a name="input_delimiter"></a> [delimiter](#input\_delimiter) | Delimiter to be used between ID elements.<br/>Defaults to `-` (hyphen). Set to `""` to use no delimiter at all. | `string` | `null` | no |
 | <a name="input_descriptor_formats"></a> [descriptor\_formats](#input\_descriptor\_formats) | Describe additional descriptors to be output in the `descriptors` output map.<br/>Map of maps. Keys are names of descriptors. Values are maps of the form<br/>`{<br/>   format = string<br/>   labels = list(string)<br/>}`<br/>(Type is `any` so the map values can later be enhanced to provide additional options.)<br/>`format` is a Terraform format string to be passed to the `format()` function.<br/>`labels` is a list of labels, in order, to pass to `format()` function.<br/>Label values will be normalized before being passed to `format()` so they will be<br/>identical to how they appear in `id`.<br/>Default is `{}` (`descriptors` output will be empty). | `any` | `{}` | no |
-| <a name="input_eks_cluster_oidc_issuer_url"></a> [eks\_cluster\_oidc\_issuer\_url](#input\_eks\_cluster\_oidc\_issuer\_url) | OIDC issuer URL for the EKS cluster (initial "https://" may be omitted) | `string` | n/a | yes |
+| <a name="input_eks_cluster_name"></a> [eks\_cluster\_name](#input\_eks\_cluster\_name) | EKS cluster name. Required when using 'pod\_identity' authentication mode to create the Pod Identity association. | `string` | `null` | no |
+| <a name="input_eks_cluster_oidc_issuer_url"></a> [eks\_cluster\_oidc\_issuer\_url](#input\_eks\_cluster\_oidc\_issuer\_url) | OIDC issuer URL for the EKS cluster (initial "https://" may be omitted). Required for 'irsa' authentication mode, optional for 'pod\_identity' mode. | `string` | `null` | no |
 | <a name="input_enabled"></a> [enabled](#input\_enabled) | Set to false to prevent the module from creating any resources | `bool` | `null` | no |
 | <a name="input_environment"></a> [environment](#input\_environment) | ID element. Usually used for region e.g. 'uw2', 'us-west-2', OR role 'prod', 'staging', 'dev', 'UAT' | `string` | `null` | no |
 | <a name="input_id_length_limit"></a> [id\_length\_limit](#input\_id\_length\_limit) | Limit `id` to this many characters (minimum 6).<br/>Set to `0` for unlimited length.<br/>Set to `null` for keep the existing setting, which defaults to `0`.<br/>Does not affect `id_full`. | `number` | `null` | no |
@@ -184,6 +206,9 @@ Here is an example of using this module:
 
 | Name | Description |
 |------|-------------|
+| <a name="output_authentication_mode"></a> [authentication\_mode](#output\_authentication\_mode) | Authentication mode used: 'irsa' or 'pod\_identity' |
+| <a name="output_pod_identity_association_arn"></a> [pod\_identity\_association\_arn](#output\_pod\_identity\_association\_arn) | ARN of the EKS Pod Identity association (only for pod\_identity mode) |
+| <a name="output_pod_identity_association_id"></a> [pod\_identity\_association\_id](#output\_pod\_identity\_association\_id) | ID of the EKS Pod Identity association (only for pod\_identity mode) |
 | <a name="output_service_account_name"></a> [service\_account\_name](#output\_service\_account\_name) | Kubernetes Service Account name |
 | <a name="output_service_account_namespace"></a> [service\_account\_namespace](#output\_service\_account\_namespace) | Kubernetes Service Account namespace |
 | <a name="output_service_account_policy_arn"></a> [service\_account\_policy\_arn](#output\_service\_account\_policy\_arn) | IAM policy ARN |
@@ -366,7 +391,7 @@ All other trademarks referenced herein are the property of their respective owne
 
 ## Copyrights
 
-Copyright © 2020-2025 [Cloud Posse, LLC](https://cloudposse.com)
+Copyright © 2020-2026 [Cloud Posse, LLC](https://cloudposse.com)
 
 
 
