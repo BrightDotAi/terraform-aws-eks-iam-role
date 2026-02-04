@@ -1,0 +1,10 @@
+version: 1
+module_version: 0.0.1
+
+test_defaults:
+  environment:
+  runner_image: "312851193143.dkr.ecr.us-west-2.amazonaws.com/infrastructure"
+
+  before_init:
+    - spacelift-configure-paths
+    - spacelift-git-use-https
