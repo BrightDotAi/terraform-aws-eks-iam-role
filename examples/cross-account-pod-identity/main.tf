@@ -10,7 +10,7 @@ data "aws_caller_identity" "current" {
   count = local.enabled ? 1 : 0
 }
 
-# Example 1: Data Analytics Pod with Auto-Generated External ID
+# Example 1: Data Analytics Pod
 # This pod can assume roles in multiple accounts for data processing
 module "data_analytics_cross_account" {
   source = "../.."
@@ -19,24 +19,24 @@ module "data_analytics_cross_account" {
   authentication_mode = "pod_identity"
   eks_cluster_name    = var.eks_cluster_name
 
+  # Define the primary ServiceAccount that will be created with shared IAM role
   service_account_name      = "data-analytics"
   service_account_namespace = "analytics"
 
   aws_account_number      = one(data.aws_caller_identity.current[*].account_id)
   aws_iam_policy_document = [one(data.aws_iam_policy_document.data_analytics[*].json)]
 
-  # Cross-account configuration with auto-generated external ID
-  cross_account_role_arns = [
-    "arn:aws:iam::${var.data_lake_account_id}:role/DataLakeReadOnlyAccess",
-    "arn:aws:iam::${var.ml_models_account_id}:role/MLModelsAccess"
-  ]
-  cross_account_external_id = "auto"  # Auto-generate for security
+  # Target role configuration: Each ServiceAccount maps to one target role
+  # Format: "namespace:service-account" = "target-role-arn"
+  target_role_arns = {
+    "analytics:data-analytics" = "arn:aws:iam::${var.data_lake_account_id}:role/DataLakeReadOnlyAccess"
+  }
 
   context = module.this.context
 }
 
-# Example 2: CI/CD Pipeline Pod with Custom External ID  
-# This pod deploys applications to multiple environments in different accounts
+# Example 2: Multi-ServiceAccount CI/CD Pipeline with Different Target Roles
+# This shows the new N:1:N pattern - multiple SAs, one shared role, different target roles
 module "cicd_cross_account" {
   source = "../.."
 
@@ -46,24 +46,29 @@ module "cicd_cross_account" {
   authentication_mode = "pod_identity"
   eks_cluster_name    = var.eks_cluster_name
 
-  service_account_name      = "deployment-agent"
-  service_account_namespace = "cicd"
+  # Traditional ServiceAccounts (no target roles - only use shared primary role)
+  service_account_namespace_name_list = [
+    "cicd:build-agent", # Build agent only needs primary role permissions
+    "cicd:test-runner"  # Test runner only needs primary role permissions
+  ]
 
   aws_account_number      = one(data.aws_caller_identity.current[*].account_id)
   aws_iam_policy_document = [one(data.aws_iam_policy_document.cicd_deployment[*].json)]
 
-  # Cross-account configuration with custom external ID
-  cross_account_role_arns = [
-    "arn:aws:iam::${var.staging_account_id}:role/EKSDeploymentRole",
-    "arn:aws:iam::${var.production_account_id}:role/EKSDeploymentRole"
-  ]
-  cross_account_external_id = var.cicd_external_id  # Custom external ID for production security
+  # Target-enabled ServiceAccounts: Each SA gets primary + specific target role
+  target_role_arns = {
+    # Staging deployment agent - can assume staging deployment role
+    "cicd:staging-deployer" = "arn:aws:iam::${var.staging_account_id}:role/EKSDeploymentRole"
+    # Production deployment agent - can assume production deployment role  
+    "cicd:prod-deployer" = "arn:aws:iam::${var.production_account_id}:role/EKSDeploymentRole"
+    # Security scanner - can assume elevated same-account role
+    "cicd:security-scanner" = "arn:aws:iam::${one(data.aws_caller_identity.current[*].account_id)}:role/ElevatedSecurityRole"
+  }
 
   context = module.this.context
 }
 
-# Example 3: Monitoring Pod with No External ID
-# This pod collects metrics from trusted internal accounts
+# Example 3: Monitoring Pod with Multiple Cross-Account Access Patterns
 module "monitoring_cross_account" {
   source = "../.."
 
@@ -73,18 +78,15 @@ module "monitoring_cross_account" {
   authentication_mode = "pod_identity"
   eks_cluster_name    = var.eks_cluster_name
 
-  service_account_name      = "prometheus-collector"
-  service_account_namespace = "monitoring"
-
   aws_account_number      = one(data.aws_caller_identity.current[*].account_id)
   aws_iam_policy_document = [one(data.aws_iam_policy_document.monitoring[*].json)]
 
-  # Cross-account configuration without external ID (trusted environment)
-  cross_account_role_arns = [
-    "arn:aws:iam::${var.dev_account_id}:role/MetricsReadOnlyAccess",
-    "arn:aws:iam::${var.staging_account_id}:role/MetricsReadOnlyAccess"
-  ]
-  cross_account_external_id = null  # No external ID for trusted internal accounts
+  # Multiple monitoring ServiceAccounts, each accessing different account environments
+  target_role_arns = {
+    "monitoring:dev-collector"     = "arn:aws:iam::${var.dev_account_id}:role/MetricsReadOnlyAccess"
+    "monitoring:staging-collector" = "arn:aws:iam::${var.staging_account_id}:role/MetricsReadOnlyAccess"
+    "monitoring:prod-collector"    = "arn:aws:iam::${var.production_account_id}:role/MetricsReadOnlyAccess"
+  }
 
   context = module.this.context
 }

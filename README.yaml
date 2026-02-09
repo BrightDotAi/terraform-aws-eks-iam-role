@@ -150,32 +150,19 @@ usage: |-
     service_account_name      = "data-processor"
     service_account_namespace = "analytics"
 
-    # Cross-account configuration
-    cross_account_role_arns = [
-      "arn:aws:iam::111111111111:role/DataLakeAccess",
-      "arn:aws:iam::222222222222:role/S3ReadOnlyAccess"
-    ]
-
-    # Security options for external ID
-    cross_account_external_id = "auto"  # or null, or custom value
+    # Target role configuration: Map ServiceAccounts to their target roles
+    target_role_arns = {
+      "analytics:data-processor" = "arn:aws:iam::111111111111:role/DataLakeAccess"
+    }
 
     # Local permissions
     aws_iam_policy_document = [data.aws_iam_policy_document.local_permissions.json]
   }
   ```
 
-  ### External ID Security Options
-
-  The `cross_account_external_id` variable provides flexible security configurations:
-
-  - **`null`** (default): No external ID requirement - simplest option for trusted environments
-  - **`"auto"`**: Auto-generate random external ID - balanced security and convenience  
-  - **`"custom-value"`**: Use specific external ID - maximum control for production environments
-  - **`""`**: Invalid - will cause validation error
-
   ### Target Account Role Configuration
 
-  The cross-account roles being assumed must trust the Pod Identity role and optionally require the external ID:
+  The cross-account roles being assumed must trust the Pod Identity role:
 
   ```hcl
   # In target account (e.g., Account B)
@@ -188,13 +175,6 @@ usage: |-
         type        = "AWS"
         identifiers = ["arn:aws:iam::SOURCE-ACCOUNT:role/SOURCE-ROLE-NAME"]
       }
-      
-      # Optional: require external ID for enhanced security
-      condition {
-        test     = "StringEquals"
-        variable = "sts:ExternalId"
-        values   = ["your-external-id-here"]  # Must match source configuration
-      }
     }
   }
   ```
@@ -203,7 +183,7 @@ examples: |-
   Here are examples of using this module:
   - [`examples/complete`](https://github.com/cloudposse/terraform-aws-eks-iam-role/tree/master/examples/complete) - complete example using IRSA authentication mode
   - [`examples/pod-identity`](https://github.com/cloudposse/terraform-aws-eks-iam-role/tree/master/examples/pod-identity) - example using EKS Pod Identity authentication mode
-  - [`examples/cross-account-pod-identity`](https://github.com/cloudposse/terraform-aws-eks-iam-role/tree/master/examples/cross-account-pod-identity) - comprehensive cross-account access example with Pod Identity, demonstrating all external ID security options
+  - [`examples/cross-account-pod-identity`](https://github.com/cloudposse/terraform-aws-eks-iam-role/tree/master/examples/cross-account-pod-identity) - comprehensive cross-account access example with Pod Identity, demonstrating N:1:N ServiceAccount relationship
 
 # How to get started quickly
 #quickstart: |-

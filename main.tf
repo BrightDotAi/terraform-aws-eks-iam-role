@@ -5,59 +5,104 @@ locals {
 
   aws_account_number = local.enabled ? coalesce(var.aws_account_number, data.aws_caller_identity.current[0].account_id) : ""
 
-  # Cross-account specific locals
-  cross_account_enabled     = local.enabled && length(var.cross_account_role_arns) > 0
-  cross_account_external_id = var.cross_account_external_id == "auto" ? random_id.cross_account_external_id[0].hex : var.cross_account_external_id
-
-  # Extract account IDs from cross-account role ARNs for validation
-  cross_account_account_ids = [
-    for arn in var.cross_account_role_arns :
-    split(":", arn)[4] if can(regex("^arn:aws:iam::[0-9]{12}:role/.+", arn))
-  ]
-
-  # If both var.service_account_namespace and var.service_account_name are provided,
-  # then the role ARN will have one of the following formats:
-  # 1. if var.service_account_namespace != var.service_account_name: arn:aws:iam::<account_number>:role/<namespace>-<environment>-<stage>-<optional_name>-<service_account_name>@<service_account_namespace>
-  # 2. if var.service_account_namespace == var.service_account_name: arn:aws:iam::<account_number>:role/<namespace>-<environment>-<stage>-<optional_name>-<service_account_name>
-
-  # 3. If var.service_account_namespace == "" and var.service_account_name is provided,
-  # then the role ARN will have format arn:aws:iam::<account_number>:role/<namespace>-<environment>-<stage>-<optional_name>-<service_account_name>@all,
-  # and the policy will use a wildcard for the namespace in the test condition to allow ServiceAccounts in any Kubernetes namespace to assume the role (useful for unlimited preview environments)
-
-  # 4. If var.service_account_name == "" and var.service_account_namespace is provided,
-  # then the role ARN will have format arn:aws:iam::<account_number>:role/<namespace>-<environment>-<stage>-<optional_name>-all@<service_account_namespace>,
-  # and the policy will use a wildcard for the service account name in the test condition to allow any ServiceAccount in the given namespace to assume the role.
-  # For more details, see https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts-technical-overview.html#iam-role-configuration
-
-  # 5. If both var.service_account_name == "" and var.service_account_namespace == "",
-  # then the role ARN will have format arn:aws:iam::<account_number>:role/<namespace>-<environment>-<stage>-<optional_name>-all@all,
-  # and the policy will use wildcards for both the namespace and the service account name in the test condition to allow all ServiceAccounts
-  # in all Kubernetes namespaces to assume the IAM role (not recommended).
-
-
+  # EXISTING: Traditional service account resolution (for SAs without target roles)
   single_service_account = var.service_account_name == null && var.service_account_namespace == null && length(var.service_account_namespace_name_list) > 0 ? [] : [
     format("%s:%s", coalesce(var.service_account_namespace, "*"), coalesce(var.service_account_name, "*"))
   ]
-  service_account_namespace_name_list = concat(local.single_service_account, var.service_account_namespace_name_list)
+  traditional_service_account_list = concat(local.single_service_account, var.service_account_namespace_name_list)
 
-  role_name_service_account_name = replace(split(":", local.service_account_namespace_name_list[0])[1], "*", "all")
-  role_name_namespace            = replace(split(":", local.service_account_namespace_name_list[0])[0], "*", "all")
-  service_account_long_id        = format("%v@%v", local.role_name_service_account_name, local.role_name_namespace)
-  service_account_id             = trimsuffix(local.service_account_long_id, format("@%v", local.role_name_service_account_name))
+  # NEW: Service accounts from target_role_arns
+  target_service_account_list = keys(var.target_role_arns)
 
-  # Try to return the first element, if that doesn't work, try the tostring approach
+  # NEW: Duplicate detection (extract SA names, accounting for wildcards)
+  traditional_sa_names = [
+    for sa_entry in local.traditional_service_account_list :
+    split(":", sa_entry)[1]
+    if !contains(["*", "all"], split(":", sa_entry)[1])
+  ]
+
+  target_sa_names = [
+    for sa_entry in local.target_service_account_list :
+    split(":", sa_entry)[1]
+  ]
+
+  duplicate_sa_names = setintersection(toset(local.traditional_sa_names), toset(local.target_sa_names))
+
+  # NEW: Combined service account list
+  all_service_account_list = concat(
+    local.traditional_service_account_list,
+    local.target_service_account_list
+  )
+
+  # NEW: Extract namespace and SA names from target_role_arns keys for validation
+  target_role_sa_entries = [
+    for sa_key in keys(var.target_role_arns) : {
+      namespace = split(":", sa_key)[0]
+      sa_name   = split(":", sa_key)[1]
+      full_key  = sa_key
+    }
+  ]
+
+  # NEW: Check for invalid K8s names when using Pod Identity
+  invalid_pod_identity_entries = var.authentication_mode == "pod_identity" ? [
+    for entry in local.target_role_sa_entries :
+    entry.full_key
+    if contains(["*", "all"], entry.namespace) ||
+    contains(["*", "all"], entry.sa_name) ||
+    !can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", entry.namespace)) ||
+    !can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", entry.sa_name))
+  ] : []
+
+  # NEW: Structured service account map
+  service_accounts_map = {
+    for sa_entry in local.all_service_account_list :
+    split(":", sa_entry)[1] => {
+      namespace            = split(":", sa_entry)[0]
+      service_account_name = split(":", sa_entry)[1]
+      full_id              = sa_entry
+      has_target_role      = contains(local.target_service_account_list, sa_entry)
+      target_role_arn      = contains(local.target_service_account_list, sa_entry) ? var.target_role_arns[sa_entry] : null
+      is_wildcard          = contains(["*", "all"], split(":", sa_entry)[1]) || contains(["*", "all"], split(":", sa_entry)[0])
+    }
+    # For Pod Identity: exclude wildcards; For IRSA: include all
+    if var.authentication_mode == "irsa" || (!contains(["*", "all"], split(":", sa_entry)[1]) && !contains(["*", "all"], split(":", sa_entry)[0]))
+  }
+
+  # NEW: Service accounts with target roles (for target associations)
+  service_accounts_with_targets = {
+    for sa_name, sa_config in local.service_accounts_map :
+    sa_name => sa_config
+    if sa_config.has_target_role
+  }
+
+  # EXISTING: Role naming logic (updated to use merged list)
+  service_account_namespace_name_list = local.all_service_account_list
+  role_name_service_account_name      = replace(split(":", local.service_account_namespace_name_list[0])[1], "*", "all")
+  role_name_namespace                 = replace(split(":", local.service_account_namespace_name_list[0])[0], "*", "all")
+  service_account_long_id             = format("%v@%v", local.role_name_service_account_name, local.role_name_namespace)
+  service_account_id                  = trimsuffix(local.service_account_long_id, format("@%v", local.role_name_service_account_name))
+
+  # NEW: Target role analysis (updated for map values)
+  all_target_arns = values(var.target_role_arns)
+  cross_account_target_arns = [
+    for target_arn in local.all_target_arns :
+    target_arn if split(":", target_arn)[4] != local.aws_account_number
+  ]
+  same_account_target_arns = [
+    for target_arn in local.all_target_arns :
+    target_arn if split(":", target_arn)[4] == local.aws_account_number
+  ]
+
+  # Updated: Target roles enabled flag
+  target_roles_enabled = local.enabled && length(var.target_role_arns) > 0
+
+  # EXISTING: Policy document handling (unchanged)
   aws_iam_policy_document = try(var.aws_iam_policy_document[0], tostring(var.aws_iam_policy_document), "{}")
   iam_policy_enabled      = local.enabled && length(var.aws_iam_policy_document) > 0
 }
 
 data "aws_caller_identity" "current" {
   count = local.enabled ? 1 : 0
-}
-
-# Generate random external ID when "auto" is specified
-resource "random_id" "cross_account_external_id" {
-  count       = local.enabled && var.cross_account_external_id == "auto" ? 1 : 0
-  byte_length = 16 # 32-character hex string for strong security
 }
 
 module "service_account_label" {
@@ -73,6 +118,30 @@ module "service_account_label" {
   id_length_limit     = 64
 
   context = module.this.context
+}
+
+# Validation for duplicate ServiceAccount names
+resource "null_resource" "validate_no_duplicate_sas" {
+  count = local.enabled && length(local.duplicate_sa_names) > 0 ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = length(local.duplicate_sa_names) == 0
+      error_message = "ServiceAccount names cannot be defined in both traditional service_account_* variables AND target_role_arns. Duplicate ServiceAccount names found: ${join(", ", local.duplicate_sa_names)}"
+    }
+  }
+}
+
+# Validation for Pod Identity naming requirements
+resource "null_resource" "validate_pod_identity_names" {
+  count = local.enabled && var.authentication_mode == "pod_identity" && length(local.invalid_pod_identity_entries) > 0 ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = length(local.invalid_pod_identity_entries) == 0
+      error_message = "Pod Identity mode requires valid Kubernetes names (no wildcards, patterns, or invalid characters) in target_role_arns keys. Invalid entries: ${join(", ", local.invalid_pod_identity_entries)}"
+    }
+  }
 }
 
 resource "aws_iam_role" "service_account" {
@@ -124,7 +193,8 @@ data "aws_iam_policy_document" "service_account_assume_role_pod_identity" {
   count = local.enabled && var.authentication_mode == "pod_identity" ? 1 : 0
 
   statement {
-    actions = ["sts:AssumeRole"]
+    sid     = "AllowEksAuthToAssumeRoleForPodIdentity"
+    actions = ["sts:AssumeRole", "sts:TagSession"]
     effect  = "Allow"
 
     principals {
@@ -155,7 +225,7 @@ resource "aws_iam_role_policy_attachment" "managed" {
 }
 
 # EKS Pod Identity Association - links the IAM role to the Kubernetes service account
-resource "aws_eks_pod_identity_association" "this" {
+resource "aws_eks_pod_identity_association" "primary" {
   count = local.enabled && var.authentication_mode == "pod_identity" ? 1 : 0
 
   cluster_name    = var.eks_cluster_name
@@ -170,47 +240,53 @@ resource "aws_eks_pod_identity_association" "this" {
       condition     = var.eks_cluster_name != null
       error_message = "eks_cluster_name must be provided when using Pod Identity authentication mode."
     }
+  }
+}
 
-    precondition {
-      condition     = var.service_account_name != null
-      error_message = "service_account_name must be provided when using Pod Identity authentication mode."
-    }
+# Target role associations - ONLY service accounts defined in target_role_arns
+resource "aws_eks_pod_identity_association" "target" {
+  for_each = local.enabled && var.authentication_mode == "pod_identity" ? local.service_accounts_with_targets : {}
 
+  cluster_name    = var.eks_cluster_name
+  namespace       = each.value.namespace
+  service_account = each.key
+  role_arn        = aws_iam_role.service_account[0].arn
+  target_role_arn = each.value.target_role_arn
+
+  tags = module.service_account_label.tags
+
+  lifecycle {
     precondition {
-      condition     = var.service_account_namespace != null
-      error_message = "service_account_namespace must be provided when using Pod Identity authentication mode."
+      condition     = var.eks_cluster_name != null
+      error_message = "eks_cluster_name must be provided when using Pod Identity authentication mode."
     }
   }
 }
 
-# IAM policy document for cross-account role assumption
-data "aws_iam_policy_document" "cross_account_assume_role" {
-  count = local.cross_account_enabled ? 1 : 0
+# IAM policy document for target role assumption
+data "aws_iam_policy_document" "target_role_assume" {
+  count = local.target_roles_enabled ? 1 : 0
 
   statement {
-    sid     = "AssumeRolesInOtherAccounts"
-    effect  = "Allow"
-    actions = ["sts:AssumeRole"]
-
-    resources = var.cross_account_role_arns
-
-    # Conditionally add external ID requirement if specified
-    dynamic "condition" {
-      for_each = local.cross_account_external_id != null ? [1] : []
-      content {
-        test     = "StringEquals"
-        variable = "sts:ExternalId"
-        values   = [local.cross_account_external_id]
-      }
-    }
+    effect    = "Allow"
+    actions   = ["sts:AssumeRole", "sts:TagSession"]
+    resources = local.all_target_arns
   }
 }
 
-# Attach cross-account assume role policy as inline policy
-resource "aws_iam_role_policy" "cross_account_assume_role" {
-  count = local.cross_account_enabled ? 1 : 0
+resource "aws_iam_policy" "target_role_assume" {
+  count = local.target_roles_enabled ? 1 : 0
 
-  name   = "${module.service_account_label.id}-cross-account-assume"
-  role   = aws_iam_role.service_account[0].id
-  policy = data.aws_iam_policy_document.cross_account_assume_role[0].json
+  name        = "${module.service_account_label.id}-target-assume"
+  description = "Allows primary role for EKS pod identity to assume target roles."
+  path        = "/"
+  policy      = data.aws_iam_policy_document.target_role_assume[0].json
+}
+
+# Attach target role assume policy as customer-managed policy
+resource "aws_iam_role_policy_attachment" "target_role_assume" {
+  count = local.target_roles_enabled ? 1 : 0
+
+  role       = aws_iam_role.service_account[0].id
+  policy_arn = aws_iam_policy.target_role_assume[0].arn
 }
