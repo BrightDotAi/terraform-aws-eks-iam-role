@@ -18,3 +18,5 @@
 # Crash log files
 crash.log
 test.log
+
+.atmos/*

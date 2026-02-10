@@ -59,19 +59,24 @@ description: |-
   This `terraform-aws-eks-iam-role` project provides a simplified mechanism for provisioning
   [AWS EKS Service Account IAM roles](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html).
 
+  ## Features
+
+  - **Multiple Authentication Modes**: Supports both IRSA (IAM Roles for Service Accounts) and EKS Pod Identity
+  - **Backward Compatible**: Defaults to IRSA mode for existing deployments
+
 # Introduction to the project
 #introduction: |-
 #  This is an introduction.
 
 # How to use this module. Should be an easy example to copy and paste.
 usage: |-
-  Here's how to invoke this module in your projects
+  ## IRSA (IAM Roles for Service Accounts) - Default Mode
 
   ```hcl
   module "eks_iam_role" {
     source = "cloudposse/eks-iam-role/aws"
     # Cloud Posse recommends pinning every module to a specific version
-    # version     = "x.x.x"
+    # version = "x.x.x"
 
     namespace   = var.namespace
     environment = var.environment
@@ -81,6 +86,8 @@ usage: |-
     attributes  = var.attributes
     tags        = var.tags
 
+    # IRSA mode (default) - requires OIDC issuer URL
+    authentication_mode         = "irsa"  # optional, defaults to "irsa"
     aws_account_number          = local.account_id
     eks_cluster_oidc_issuer_url = module.eks_cluster.eks_cluster_identity_oidc_issuer
 
@@ -90,31 +97,93 @@ usage: |-
     # JSON IAM policy document to assign to the service account role
     aws_iam_policy_document = [data.aws_iam_policy_document.autoscaler.json]
   }
+  ```
 
-  data "aws_iam_policy_document" "autoscaler" {
-    statement {
-      sid = "AllowToScaleEKSNodeGroupAutoScalingGroup"
+  ## EKS Pod Identity
 
-      actions = [
-        "ec2:DescribeLaunchTemplateVersions",
-        "autoscaling:TerminateInstanceInAutoScalingGroup",
-        "autoscaling:SetDesiredCapacity",
-        "autoscaling:DescribeTags",
-        "autoscaling:DescribeLaunchConfigurations",
-        "autoscaling:DescribeAutoScalingInstances",
-        "autoscaling:DescribeAutoScalingGroups"
-      ]
+  ```hcl
+  module "eks_iam_role_pod_identity" {
+    source = "cloudposse/eks-iam-role/aws"
+    # Cloud Posse recommends pinning every module to a specific version
+    # version = "x.x.x"
 
-      effect    = "Allow"
-      resources = ["*"]
-    }
+    namespace   = var.namespace
+    environment = var.environment
+    stage       = var.stage
+    name        = var.name
+
+    # Pod Identity mode - simpler, no OIDC configuration required
+    authentication_mode = "pod_identity"
+    eks_cluster_name    = "my-eks-cluster"  # Required for Pod Identity associations
+    aws_account_number  = local.account_id
+    # eks_cluster_oidc_issuer_url not required for Pod Identity
+
+    # Create a role for the service account
+    service_account_name      = "aws-load-balancer-controller"
+    service_account_namespace = "kube-system"
+    # JSON IAM policy document to assign to the service account role
+    aws_iam_policy_document = [data.aws_iam_policy_document.load_balancer_controller.json]
   }
   ```
 
+  **Note**: When using Pod Identity mode, the module automatically creates the EKS Pod Identity association that links the IAM role to the Kubernetes service account. No manual `aws eks create-pod-identity-association` commands are needed!
+
+  ## Cross-Account Access with EKS Pod Identity
+
+  EKS Pod Identity supports cross-account scenarios through IAM role delegation. The local Pod Identity role assumes roles in other AWS accounts.
+
+  ```hcl
+  module "cross_account_data_analytics" {
+    source = "cloudposse/eks-iam-role/aws"
+    # Cloud Posse recommends pinning every module to a specific version
+    # version = "x.x.x"
+
+    namespace   = var.namespace
+    environment = var.environment
+    stage       = var.stage
+    name        = "data-analytics"
+
+    # Pod Identity configuration
+    authentication_mode = "pod_identity"
+    eks_cluster_name    = "my-eks-cluster"
+
+    service_account_name      = "data-processor"
+    service_account_namespace = "analytics"
+
+    # Target role configuration: Map ServiceAccounts to their target roles
+    target_role_arns = {
+      "analytics:data-processor" = "arn:aws:iam::111111111111:role/DataLakeAccess"
+    }
+
+    # Local permissions
+    aws_iam_policy_document = [data.aws_iam_policy_document.local_permissions.json]
+  }
+  ```
+
+  ### Target Account Role Configuration
+
+  The cross-account roles being assumed must trust the Pod Identity role:
+
+  ```hcl
+  # In target account (e.g., Account B)
+  data "aws_iam_policy_document" "trust_policy" {
+    statement {
+      effect  = "Allow"
+      actions = ["sts:AssumeRole"]
+      
+      principals {
+        type        = "AWS"
+        identifiers = ["arn:aws:iam::SOURCE-ACCOUNT:role/SOURCE-ROLE-NAME"]
+      }
+    }
+  }
+  ```
 # Example usage
 examples: |-
-  Here is an example of using this module:
-  - [`examples/complete`](https://github.com/cloudposse/terraform-aws-eks-iam-role/tree/master/examples/complete) - complete example of using this module
+  Here are examples of using this module:
+  - [`examples/complete`](https://github.com/cloudposse/terraform-aws-eks-iam-role/tree/master/examples/complete) - complete example using IRSA authentication mode
+  - [`examples/pod-identity`](https://github.com/cloudposse/terraform-aws-eks-iam-role/tree/master/examples/pod-identity) - example using EKS Pod Identity authentication mode
+  - [`examples/cross-account-pod-identity`](https://github.com/cloudposse/terraform-aws-eks-iam-role/tree/master/examples/cross-account-pod-identity) - comprehensive cross-account access example with Pod Identity, demonstrating N:1:N ServiceAccount relationship
 
 # How to get started quickly
 #quickstart: |-
