@@ -49,8 +49,8 @@ locals {
     entry.full_key
     if contains(["*", "all"], entry.namespace) ||
     contains(["*", "all"], entry.sa_name) ||
-    !can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", entry.namespace)) ||
-    !can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", entry.sa_name))
+    !can(regex("^[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?$", entry.namespace)) ||
+    !can(regex("^[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?$", entry.sa_name))
   ] : []
 
   # NEW: Structured service account map
